@@ -10548,3 +10548,80 @@ if __name__  == "__main__":
 
         GefAliases()
         GefTmuxSetup()
+
+@register_command
+class VTable(GenericCommand):
+    """check vtable frequency command."""
+
+    _cmdline_ = "vtable"
+    _syntax_ = "{:s}".format(_cmdline_)
+
+    def get_vptr2symbol_map(self):
+        # vtable pointer to symbol map
+        # {vpointer_address : （symbol, demangle_symbol）}
+        vptr2symbol = {}
+        stream = StringIO(gdb.execute("maintenance print msymbols", to_string=True))
+        for line in stream:
+            if len(line) == 0 or line[0] != '[':
+                continue
+
+            items = line.split()
+            if not items[3].startswith("_ZTV"):
+                continue
+
+            addr = int(items[2], 16) + 0x10
+            vptr = addr.to_bytes(8, byteorder='little')
+            symbol = items[3]
+
+            demangle = gdb.execute("demangle -l c++ %s" % symbol, to_string=True)
+            if demangle.startswith("vtable for"):
+                demangle = demangle.strip()[len("vtable for "):]
+
+            vptr2symbol[vptr] = (symbol, demangle)
+
+        return vptr2symbol
+
+    @only_if_gdb_running  # not required, ensures that the debug session is started
+    def do_invoke(self, argv):
+        self.show_vtable_freq()
+
+    def show_vtable_freq(self):
+        core_analysis = False
+        for l in gdb.execute("info inferiors", to_string=True).splitlines():
+            if l.startswith("* ") and "(core)" in l:
+                core_analysis = True
+
+        vptr2symbol = self.get_vptr2symbol_map()
+        print("analyze vtable size %d" % len(vptr2symbol))
+        vptr2freq = {}
+
+        sections = get_info_sections() if core_analysis else get_process_maps()
+        for section in sections:
+            start = section.page_start
+            end = section.page_end
+            length = end - start
+            ptr_size = 8
+
+            if start == 0 or length <= 4096 or length % ptr_size != 0:
+                continue
+            if not ("load" in section.path or "heap" in section.path or "stack" in section.path):
+                continue
+
+            mem = gdb.selected_inferior().read_memory(start, length)
+            print("analyze section %s with length %d" % (section.path, len(mem)))
+
+            for i in range(0, length, ptr_size):
+                value = bytes(mem[i : i + ptr_size])
+                if value in vptr2symbol.keys():
+                    vptr2freq[value] = vptr2freq.get(value, 0) + 1
+
+        print("analyze done.")
+        print("vtable frequency:")
+
+        print("Frequency to Symbol:")
+        for vptr, freq in sorted(vptr2freq.items(), key = lambda x : x[1]):
+            print("%d %s" % (freq, vptr2symbol.get(vptr)))
+
+        return
+
+register_external_command(VTable())
