@@ -10570,12 +10570,18 @@ class VTable(GenericCommand):
                 continue
 
             addr = int(items[2], 16) + 0x10
-            vptr = addr.to_bytes(8, byteorder='little')
-            symbol = items[3]
 
-            demangle = gdb.execute("demangle -l c++ %s" % symbol, to_string=True)
-            if demangle.startswith("vtable for"):
-                demangle = demangle.strip()[len("vtable for "):]
+            byteorder = "little" if get_endian() == Elf.LITTLE_ENDIAN else "big"
+            vptr = addr.to_bytes(8, byteorder=byteorder)
+
+            symbol = items[3]
+            demangle = symbol
+            try:
+                demangle = gdb.execute("demangle -l c++ %s" % symbol, to_string=True)
+                if demangle.startswith("vtable for"):
+                    demangle = demangle.strip()[len("vtable for "):]
+            except gdb.error as e:
+                warn(e)
 
             vptr2symbol[vptr] = (symbol, demangle)
 
@@ -10616,7 +10622,6 @@ class VTable(GenericCommand):
                     vptr2freq[value] = vptr2freq.get(value, 0) + 1
 
         print("analyze done.")
-        print("vtable frequency:")
 
         print("Frequency to Symbol:")
         for vptr, freq in sorted(vptr2freq.items(), key = lambda x : x[1]):
