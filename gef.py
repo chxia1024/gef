@@ -10549,12 +10549,43 @@ if __name__  == "__main__":
         GefAliases()
         GefTmuxSetup()
 
+@lru_cache()
+def get_data_sections():
+    core_analysis = False
+    for l in gdb.execute("info inferiors", to_string=True).splitlines():
+        if l.startswith("* ") and "(core)" in l:
+            core_analysis = True
+
+    sections = get_info_sections() if core_analysis else get_process_maps()
+
+    data_sections = []
+
+    for section in sections:
+        start = section.page_start
+        end = section.page_end
+        length = end - start
+        ptr_size = 8
+
+        if start == 0 or length <= 4096 or length % ptr_size != 0:
+            continue
+        if not ("load" in section.path or "heap" in section.path or "stack" in section.path):
+            continue
+
+        data_sections.append(section)
+
+    return data_sections
+
 @register_command
 class VTable(GenericCommand):
     """check vtable frequency command."""
 
     _cmdline_ = "vtable"
     _syntax_ = "{:s}".format(_cmdline_)
+
+    def __init__(self):
+        super(VTable, self).__init__()
+        self.data_sections = None
+        self.vptr2symbol = None
 
     def get_vptr2symbol_map(self):
         # vtable pointer to symbol map
@@ -10592,41 +10623,84 @@ class VTable(GenericCommand):
         self.show_vtable_freq()
 
     def show_vtable_freq(self):
-        core_analysis = False
-        for l in gdb.execute("info inferiors", to_string=True).splitlines():
-            if l.startswith("* ") and "(core)" in l:
-                core_analysis = True
+        if self.vptr2symbol is None:
+            self.vptr2symbol = self.get_vptr2symbol_map()
 
-        vptr2symbol = self.get_vptr2symbol_map()
-        print("analyze vtable size %d" % len(vptr2symbol))
+        print("analyze %d vtables" % len(self.vptr2symbol))
+
+        if self.data_sections is None:
+            self.data_sections = get_data_sections()
+
+        total_size = sum([x.size for x in self.data_sections])
+        print("analyze %d data sections with total size %d(MB)" % (len(self.data_sections), total_size >> 20))
+
         vptr2freq = {}
-
-        sections = get_info_sections() if core_analysis else get_process_maps()
-        for section in sections:
+        for section in self.data_sections:
             start = section.page_start
             end = section.page_end
             length = end - start
             ptr_size = 8
 
-            if start == 0 or length <= 4096 or length % ptr_size != 0:
-                continue
-            if not ("load" in section.path or "heap" in section.path or "stack" in section.path):
-                continue
-
             mem = gdb.selected_inferior().read_memory(start, length)
-            print("analyze section %s with length %d" % (section.path, len(mem)))
+            print("analyze section %s with size %d" % (section.path, len(mem)))
 
             for i in range(0, length, ptr_size):
                 value = bytes(mem[i : i + ptr_size])
-                if value in vptr2symbol.keys():
+                if value in self.vptr2symbol.keys():
                     vptr2freq[value] = vptr2freq.get(value, 0) + 1
 
         print("analyze done.")
-
         print("Frequency to Symbol:")
         for vptr, freq in sorted(vptr2freq.items(), key = lambda x : x[1]):
-            print("%d %s" % (freq, vptr2symbol.get(vptr)))
+            print("%d %s" % (freq, self.vptr2symbol.get(vptr)))
 
         return
 
 register_external_command(VTable())
+
+@register_command
+class FindMemory(GenericCommand):
+    """find memory."""
+
+    _cmdline_ = "find-memory"
+    _syntax_ = "{:s}".format(_cmdline_)
+
+    def __init__(self):
+        super(FindMemory, self).__init__()
+        self.data_sections = None
+
+    def find_memory(self, target):
+        oldt = gdb.selected_thread()
+        stacks = []
+        for t in gdb.selected_inferior().threads():
+            t.switch()
+            stacks.append((int(str(gdb.parse_and_eval('$rsp')), 16), str(t.num)))
+        oldt.switch()
+        addrs = []
+
+        if self.data_sections is None:
+            self.data_sections = get_data_sections()
+
+        for section in self.data_sections:
+            in_stack = [ s[1] for s in stacks if section.page_start <= s[0] and s[0] < section.page_end ]
+            stack = ":".join(in_stack)
+            addr = gdb.execute('find /g %s,%s,%s' % (section.page_start, section.page_end, target), to_string=True).split('\n')
+            addr = [ (a, stack) for a in addr if a.startswith('0x') ]
+            addrs.extend(addr)
+        return addrs
+
+    @only_if_gdb_running  # not required, ensures that the debug session is started
+    def do_invoke(self, argv):
+        argc = len(argv)
+        if argc < 1:
+            self.usage()
+            return
+
+        pattern = argv[0]
+        addrs = self.find_memory(pattern)
+        for (a, s) in addrs:
+            print("\n%s %s" % (a, s))
+            ret = gdb.execute('x/32ag %s-240' % a, to_string=True)
+            print(ret)
+
+register_external_command(FindMemory())
